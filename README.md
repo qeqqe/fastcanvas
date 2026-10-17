@@ -64,4 +64,4 @@ Logs from the last run are in `~/.cache/fastfetch-canvas.log`. To uninstall, del
 
 ---
 
-Thanks to [bartleyg/my-spotify-canvas](https://github.com/bartleyg/my-spotify-canvas) for the original Canvas reverse engineering, and [This PR](https://github.com/kushagrasinghx/BitChord/pull/46) for the current GraphQL query.
+Thanks to [bartleyg/my-spotify-canvas](https://github.com/bartleyg/my-spotify-canvas) for the original Canvas reverse engineering, and [This PR](https://github.com/kushagrasinghx/BitChord/pull/461) for the current GraphQL query.
