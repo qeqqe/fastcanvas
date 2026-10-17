@@ -1,13 +1,8 @@
-process.on("uncaughtException", (err) => {
-  console.error(
-    "uncaughtException:",
-    err && (err instanceof Error ? err.stack : err)
-  );
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("unhandledRejection:", reason);
-});
+import { getCanvas } from "./canvas/getCanvas.js";
 
-import { getCanvases } from "./canvas/getCanvas.js";
+process.loadEnvFile(new URL("../.env", import.meta.url));
 
-getCanvases().catch((e) => console.error("getCanvases failed:", e));
+getCanvas().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exitCode = 1;
+});

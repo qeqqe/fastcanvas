@@ -1,248 +1,122 @@
-import { getToken } from "../auth/spotifyAuth.js";
-import { CurrentPlayingRes, getTrackInfo } from "../helper/getCurrentTrack.js";
-import * as canvas from "../proto/_canvas.js";
-import * as fs from "fs/promises";
-import * as path from "path";
-import * as os from "os";
-interface Track {
-  setTrackUri(uri: string): void;
+import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getWebPlayerToken } from "../auth/spotifyAuth.js";
+import { getTrackInfo } from "../helper/getCurrentTrack.js";
+
+const MEDIA_DIR = path.join(os.homedir(), "images", "fastfetch", "media");
+const PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v2/query";
+// persisted hash of the web player's `canvas` query, refreshed from its bundles if it goes stale
+const KNOWN_CANVAS_HASH = "575138ab27cd5c1b3e54da54d0a7cc8d85485402de26340c2145f0f6bb5e7a9f";
+
+interface CanvasQueryResponse {
+  data?: { trackUnion?: { canvas?: { url?: string } | null } };
+  errors?: { message: string }[];
 }
 
-interface CanvasRequest {
-  addTracks(track: Track): void;
-  serializeBinary(): Uint8Array;
+async function fetchText(url: string): Promise<string> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`GET ${url}: HTTP ${res.status}`);
+  return res.text();
 }
 
-interface CanvasResponse {
-  deserializeBinary(data: Uint8Array): CanvasResponse;
-  toObject(): any;
+async function findCanvasHash(): Promise<string | null> {
+  const html = await fetchText("https://open.spotify.com/");
+  const scripts = new Set(
+    html.match(/https:\/\/open\.spotifycdn\.com\/cdn\/build\/web-player\/[\w.~-]+\.js/g)
+  );
+  for (const script of scripts) {
+    const match = (await fetchText(script)).match(/"canvas","query","([0-9a-f]{64})"/);
+    if (match) return match[1]!;
+  }
+  return null;
 }
 
-interface Canvases {
-  data: Data;
+async function queryCanvas(trackUri: string, token: string, hash = KNOWN_CANVAS_HASH): Promise<string | null> {
+  const res = await fetch(PATHFINDER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "App-Platform": "WebPlayer",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      operationName: "canvas",
+      variables: { trackUri },
+      extensions: { persistedQuery: { version: 1, sha256Hash: hash } },
+    }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`Canvas query: HTTP ${res.status}`);
+
+  const body = (await res.json()) as CanvasQueryResponse;
+  if (body.errors?.some((e) => e.message.includes("PersistedQueryNotFound"))) {
+    const fresh = hash === KNOWN_CANVAS_HASH ? await findCanvasHash() : null;
+    if (!fresh || fresh === hash) throw new Error("Canvas query hash is stale");
+    return queryCanvas(trackUri, token, fresh);
+  }
+  const url = body.data?.trackUnion?.canvas?.url;
+  // some canvases are still images; only video ones are used
+  return url && /\.mp4(\?|$)/i.test(url) ? url : null;
 }
 
-interface Data {
-  canvasesList: CanvasesList[];
+async function download(url: string, dest: string): Promise<void> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok) throw new Error(`Download failed: HTTP ${res.status}`);
+  await fs.writeFile(dest, Buffer.from(await res.arrayBuffer()));
 }
 
-interface CanvasesList {
-  id: string;
-  canvasUrl: string;
-  trackUri: string;
-  otherId: string;
-  canvasUri: string;
-}
-
-interface CanvasRequestConstructor {
-  new (): CanvasRequest;
-  Track: new () => Track;
-}
-
-interface CanvasResponseConstructor {
-  new (): CanvasResponse;
-  deserializeBinary(data: Uint8Array): CanvasResponse;
-}
-
-interface ProtoModule {
-  CanvasRequest: CanvasRequestConstructor;
-  CanvasResponse: CanvasResponseConstructor;
-}
-
-export async function getCanvases(): Promise<any | null> {
-  try {
-    const CanvasRequest = canvas.CanvasRequest;
-    const CanvasResponse = canvas.CanvasResponse;
-
-    const accessToken = await getToken();
-    if (!accessToken) {
-      console.error("Failed to obtain Canvas API token");
-      return null;
-    }
-
-    const track_info: CurrentPlayingRes | null = await getTrackInfo();
-    if (!track_info) {
-      return null;
-    }
-
-    if (await alreadyExists(track_info.album_uri)) {
-      console.log("Canvas already exists for this album");
-      process.exit(0);
-    }
-    const canvasRequest = new CanvasRequest();
-    const track = new CanvasRequest.Track();
-    if (!track_info?.uri) {
-      return null;
-    }
-    track.track_uri = track_info.uri;
-    const tracks = canvasRequest.tracks || [];
-    tracks.push(track);
-    canvasRequest.tracks = tracks;
-
-    const requestBytes = canvasRequest.serializeBinary();
-
-    const response = await fetch(
-      "https://spclient.wg.spotify.com/canvaz-cache/v0/canvases",
-      {
-        method: "POST",
-        body: Buffer.from(requestBytes),
-        headers: {
-          Accept: "application/protobuf",
-          "Content-Type": "application/x-www-form-urlencoded",
-          "Accept-Language": "en",
-          "User-Agent": "Spotify/9.0.34.593 iOS/18.4 (iPhone15,3)",
-          "Accept-Encoding": "gzip, deflate, br",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        signal: AbortSignal.timeout(10000),
-      }
+function toGif(input: string, output: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(
+      "ffmpeg",
+      // kitten icat's cost scales with frame count, so keep the gif lean
+      ["-y", "-loglevel", "error", "-i", input, "-vf", "fps=10,scale=320:-1:flags=lanczos", output],
+      { stdio: ["ignore", "ignore", "inherit"] }
     );
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const responseData = await response.arrayBuffer();
-    const responseBytes = new Uint8Array(responseData);
-
-    const canvasResponse = CanvasResponse.deserializeBinary(responseBytes);
-    if (canvasResponse?.canvases?.[0]?.canvas_url) {
-      console.log("Got canvas for track");
-      await downloadMedia(
-        canvasResponse.canvases[0].canvas_url,
-        "canvas",
-        track_info.album_uri
-      );
-    } else {
-      console.log("No canvas available, using album cover");
-      await downloadMedia(track_info.images, "image", track_info.album_uri);
-    }
-    return canvasResponse.toObject();
-  } catch (error) {
-    console.error("Failed to get canvas:", error);
-    return null;
-  }
+    ffmpeg.on("error", reject);
+    ffmpeg.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited with ${code}`))));
+  });
 }
 
-async function alreadyExists(album_uri: string): Promise<boolean> {
-  const outputDir = path.join(os.homedir(), "images", "fastfetch", "media");
-  try {
-    const files = await fs.readdir(outputDir);
-    return files.some((file: string) => path.parse(file).name === album_uri);
-  } catch {
-    return false;
+export async function getCanvas(): Promise<void> {
+  const track = await getTrackInfo();
+  if (!track) {
+    console.log("Nothing playing or recently played");
+    return;
   }
-}
-async function downloadMedia(
-  url: string,
-  mediaType: "canvas" | "image",
-  album_uri: string
-): Promise<void> {
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const extension = mediaType === "canvas" ? ".mp4" : ".jpg";
-
-    const outputDir = path.join(os.homedir(), "images", "fastfetch", "media");
-    await fs.mkdir(outputDir, { recursive: true });
-
-    // wipe everything in the dir
-    try {
-      const existingFiles = await fs.readdir(outputDir);
-      for (const file of existingFiles) {
-        try {
-          await fs.unlink(path.join(outputDir, file));
-        } catch {
-          // ignore
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    // sanitize
-    const baseName = (album_uri || "media").replace(/[^\w.-]/g, "_");
-
-    if (mediaType === "canvas") {
-      const inputBuffer = Buffer.from(await response.arrayBuffer());
-      const tempInputPath = path.join(
-        outputDir,
-        `${baseName}_input${extension}`
-      );
-      const outputGifPath = path.join(outputDir, `${baseName}.gif`);
-
-      await fs.writeFile(tempInputPath, inputBuffer);
-
-      try {
-        const ffmpegImport: any = await import("fluent-ffmpeg");
-        const ffmpeg = ffmpegImport.default ?? ffmpegImport;
-
-        // ensure any gif is removed
-        try {
-          await fs.unlink(outputGifPath);
-        } catch {}
-
-        await new Promise<void>((resolve, reject) => {
-          ffmpeg()
-            .input(tempInputPath)
-            .outputFormat("gif")
-            .outputOptions(["-vf", "fps=15,scale=480:-1:flags=lanczos"])
-            .on("end", () => {
-              console.log(`Downloaded canvas: ${outputGifPath}`);
-              resolve();
-            })
-            .on("error", (err: any) => reject(err))
-            .save(outputGifPath);
-        });
-
-        // after conversion, remove any mp4s that match the baseName
-        try {
-          const postFiles = await fs.readdir(outputDir);
-          for (const f of postFiles) {
-            if (
-              f.startsWith(baseName) &&
-              path.extname(f).toLowerCase() === extension
-            ) {
-              try {
-                await fs.unlink(path.join(outputDir, f));
-              } catch {
-                // ignore
-              }
-            }
-          }
-        } catch {
-          // ignore
-        }
-      } catch (err) {
-        const fallbackPath = path.join(outputDir, `${baseName}${extension}`);
-        try {
-          await fs.unlink(fallbackPath);
-        } catch {}
-        await fs.writeFile(fallbackPath, inputBuffer);
-        console.log(`Downloaded canvas (video): ${fallbackPath}`);
-      } finally {
-        try {
-          await fs.unlink(tempInputPath);
-        } catch {}
-      }
-
-      return;
-    }
-
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    const filePath = path.join(outputDir, `${baseName}${extension}`);
-    const tmpPath = path.join(outputDir, `${baseName}.tmp`);
-
-    // ensure no existing file
-    try {
-      await fs.unlink(filePath);
-    } catch {}
-
-    await fs.writeFile(tmpPath, buffer);
-    await fs.rename(tmpPath, filePath);
-    console.log(`Downloaded cover: ${filePath}`);
-  } catch (error) {
-    console.error(`Download failed: ${error}`);
+  await fs.mkdir(MEDIA_DIR, { recursive: true });
+  const existing = await fs.readdir(MEDIA_DIR);
+  if (existing.some((f) => path.parse(f).name === track.id)) {
+    console.log("Media already cached for this track");
+    return;
   }
+
+  let canvasUrl: string | null = null;
+  try {
+    canvasUrl = await queryCanvas(track.uri, await getWebPlayerToken());
+  } catch (err) {
+    console.error(`Canvas lookup failed, using album cover: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const base = path.join(MEDIA_DIR, track.id);
+  if (canvasUrl) {
+    await download(canvasUrl, `${base}.mp4`);
+    try {
+      await toGif(`${base}.mp4`, `${base}.gif`);
+    } finally {
+      await fs.rm(`${base}.mp4`, { force: true });
+    }
+  } else if (track.image) {
+    await download(track.image, `${base}.jpg`);
+  } else {
+    console.log("Track has no canvas or cover");
+    return;
+  }
+
+  // only clear the previous media once the new file is in place
+  await Promise.all(existing.map((f) => fs.rm(path.join(MEDIA_DIR, f), { force: true })));
+  console.log(`Saved ${canvasUrl ? "canvas" : "cover"} for ${track.uri}`);
 }

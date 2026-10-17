@@ -1,304 +1,117 @@
 import * as OTPAuth from "otpauth";
-import * as dotenv from "dotenv";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
-dotenv.config();
+const CACHE_DIR = path.join(os.homedir(), ".cache", "fastfetch-spotify-canvas");
 
-const SP_DC = process.env.SP_DC;
-const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
-const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
-const SPOTIFY_REFRESH_TOKEN = process.env.SPOTIFY_REFRESH_TOKEN;
-
-// token caching
-let cachedAccessToken: string | null = null;
-let tokenExpiresAt = 0;
-const SECRETS_URL =
+const DEFAULT_SECRETS_URL =
   "https://raw.githubusercontent.com/xyloflake/spot-secrets-go/refs/heads/main/secrets/secretDict.json";
 
-let currentTotp: OTPAuth.TOTP | null = null;
-let currentTotpVersion: string | null = null;
-let lastFetchTime = 0;
-const FETCH_INTERVAL = 60 * 60 * 1000; 
+const USER_AGENT =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
-let updatePromise: Promise<void> | null = null;
-
-interface SecretsDict {
-  [version: string]: number[];
+function requireEnv(...names: string[]): string[] {
+  const missing = names.filter((n) => !process.env[n]);
+  if (missing.length) throw new Error(`Missing ${missing.join(", ")} in .env`);
+  return names.map((n) => process.env[n]!);
 }
 
-interface ServerTimeResponse {
-  serverTime: string;
+interface CachedToken {
+  token: string;
+  expiresAt: number;
 }
 
-interface TokenResponse {
-  accessToken?: string;
+// Tokens live for an hour, so keep them on disk instead of minting one every run.
+async function cached(name: string, mint: () => Promise<CachedToken>): Promise<string> {
+  const file = path.join(CACHE_DIR, `${name}.json`);
+  const hit = JSON.parse(await readFile(file, "utf8").catch(() => "null")) as CachedToken | null;
+  if (hit && hit.expiresAt > Date.now() + 60_000) return hit.token;
+
+  const fresh = await mint();
+  await mkdir(CACHE_DIR, { recursive: true });
+  await writeFile(file, JSON.stringify(fresh), { mode: 0o600 });
+  return fresh.token;
 }
 
-interface AuthPayload {
-  reason: string;
-  productType: string;
-  totp: string;
-  totpVer: string;
-  totpServer: string;
-}
+// Official Web API token (refresh-token flow), used for now-playing.
+export const getAccessToken = () => cached("access-token", mintAccessToken);
 
-function userAgent(): string {
-  return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
-}
+// Web player token minted from the sp_dc cookie, used for the canvas query.
+export const getWebPlayerToken = () => cached("web-player-token", mintWebPlayerToken);
 
-function createTotpSecret(data: number[]): OTPAuth.Secret {
-  const mappedData = data.map((value, index) => value ^ ((index % 33) + 9));
-  const hexData = Buffer.from(mappedData.join(""), "utf8").toString("hex");
-  return OTPAuth.Secret.fromHex(hexData);
-}
-
-async function fetchSecretsFromGitHub(): Promise<SecretsDict> {
-  try {
-    const response = await fetch(SECRETS_URL, {
-      method: "GET",
-      headers: {
-        "User-Agent": userAgent(),
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const secrets = (await response.json()) as SecretsDict;
-    return secrets;
-  } catch (error) {
-    throw error;
-  }
-}
-
-function findNewestVersion(secrets: SecretsDict): string {
-  const versions = Object.keys(secrets).map(Number);
-  return Math.max(...versions).toString();
-}
-
-function useFallbackSecret(): void {
-  // This secret will most likely fail because Spotify rotates secrets every couple of days
-  // v61 
-  const fallbackData = [
-    44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97, 75, 76, 94, 102, 43, 69, 49, 120, 118, 80, 64, 78 
-  ];
-  const totpSecret = createTotpSecret(fallbackData);
-
-  currentTotp = new OTPAuth.TOTP({
-    period: 30,
-    digits: 6,
-    algorithm: "SHA1",
-    secret: totpSecret,
-  });
-
-  currentTotpVersion = "19";
-}
-
-async function updateTotpSecrets(): Promise<void> {
-  if (updatePromise) {
-    return updatePromise;
-  }
-
-  updatePromise = (async () => {
-    try {
-      const now = Date.now();
-      if (now - lastFetchTime < FETCH_INTERVAL) {
-        return;
-      }
-
-      const secrets = await fetchSecretsFromGitHub();
-      const newestVersion = findNewestVersion(secrets);
-
-      if (newestVersion && newestVersion !== currentTotpVersion) {
-        const secretData = secrets[newestVersion];
-        if (!secretData || !Array.isArray(secretData)) {
-          throw new Error(`Invalid secret data for version ${newestVersion}`);
-        }
-
-        const totpSecret = createTotpSecret(secretData);
-
-        currentTotp = new OTPAuth.TOTP({
-          period: 30,
-          digits: 6,
-          algorithm: "SHA1",
-          secret: totpSecret,
-        });
-
-        currentTotpVersion = newestVersion;
-        lastFetchTime = now;
-      } else {
-        lastFetchTime = now;
-      }
-    } catch (error) {
-      if (!currentTotp) {
-        useFallbackSecret();
-      }
-    } finally {
-      updatePromise = null;
-    }
-  })();
-
-  return updatePromise;
-}
-
-async function initializeTotpSecrets(): Promise<void> {
-  try {
-    await updateTotpSecrets();
-  } catch (error) {
-    useFallbackSecret();
-  }
-}
-
-function generateTOTP(timestamp: number): string {
-  if (!currentTotp) {
-    throw new Error("TOTP not initialized");
-  }
-  return currentTotp.generate({ timestamp });
-}
-
-async function getServerTime(): Promise<number> {
-  try {
-    const response = await fetch("https://open.spotify.com/api/server-time", {
-      method: "GET",
-      headers: {
-        "User-Agent": userAgent(),
-        Origin: "https://open.spotify.com/",
-        Referer: "https://open.spotify.com/",
-        Cookie: `sp_dc=${SP_DC}`,
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as ServerTimeResponse;
-    const time = Number(data.serverTime);
-
-    if (isNaN(time) || time <= 0) {
-      throw new Error("Invalid server time");
-    }
-
-    return time * 1000;
-  } catch (error) {
-    return Date.now();
-  }
-}
-
-async function generateAuthPayload(
-  reason: string,
-  productType: string
-): Promise<AuthPayload> {
-  const localTime = Date.now();
-  const serverTime = await getServerTime();
-
-  return {
-    reason,
-    productType,
-    totp: generateTOTP(localTime),
-    totpVer: currentTotpVersion || "19",
-    totpServer: generateTOTP(Math.floor(serverTime / 30)),
-  };
-}
-
-// get OAuth access token using refresh token flow with caching
-// tokens are cached for 1 hour (expires_in - 60 seconds for safety)
-export async function getAccessToken(): Promise<string> {
-  if (cachedAccessToken && Date.now() < tokenExpiresAt) {
-    return cachedAccessToken;
-  }
-
-  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET || !SPOTIFY_REFRESH_TOKEN) {
-    throw new Error(
-      "Missing Spotify OAuth credentials. Please set SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REFRESH_TOKEN in .env"
-    );
-  }
-
-  try {
-    const response = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization:
-          "Basic " +
-          Buffer.from(
-            `${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`
-          ).toString("base64"),
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: SPOTIFY_REFRESH_TOKEN,
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as {
-      access_token: string;
-      expires_in: number;
-    };
-
-    cachedAccessToken = data.access_token;
-    tokenExpiresAt = Date.now() + data.expires_in * 1000 - 60000;
-
-    return cachedAccessToken;
-  } catch (error) {
-    console.error("Failed to get OAuth access token:", error);
-    throw error;
-  }
-}
-
-export async function getToken(
-  reason = "init",
-  productType = "mobile-web-player"
-): Promise<string | undefined> {
-  if (!currentTotp) {
-    await initializeTotpSecrets();
-  }
-
-  if (Date.now() - lastFetchTime >= FETCH_INTERVAL) {
-    try {
-      await updateTotpSecrets();
-    } catch (error) {
-      console.warn(
-        "Failed to update TOTP secrets, continuing with current version:",
-        error
-      );
-    }
-  }
-
-  const payload = await generateAuthPayload(reason, productType);
-
-  const url = new URL("https://open.spotify.com/api/token");
-  Object.entries(payload).forEach(([key, value]) =>
-    url.searchParams.append(key, value)
+async function mintAccessToken(): Promise<CachedToken> {
+  const [clientId, clientSecret, refreshToken] = requireEnv(
+    "SPOTIFY_CLIENT_ID",
+    "SPOTIFY_CLIENT_SECRET",
+    "SPOTIFY_REFRESH_TOKEN"
   );
 
-  try {
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        "User-Agent": userAgent(),
-        Origin: "https://open.spotify.com/",
-        Referer: "https://open.spotify.com/",
-        Cookie: `sp_dc=${SP_DC}`,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as TokenResponse;
-    return data.accessToken;
-  } catch (error) {
-    console.error("Failed to get token:", error);
-    throw error;
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization:
+        "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken!,
+    }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) {
+    throw new Error(`Refresh token rejected (HTTP ${res.status}), run \`pnpm run auth\``);
   }
+  const data = (await res.json()) as { access_token: string; expires_in: number };
+  return { token: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+}
+
+// The web player token request is signed with a TOTP whose secret Spotify rotates.
+async function mintWebPlayerToken(): Promise<CachedToken> {
+  const [spDc] = requireEnv("SP_DC");
+
+  const secretsUrl = process.env.SPOTIFY_SECRETS_URL || DEFAULT_SECRETS_URL;
+  const secretsRes = await fetch(secretsUrl, { signal: AbortSignal.timeout(10000) });
+  if (!secretsRes.ok) throw new Error(`Failed to fetch TOTP secrets (HTTP ${secretsRes.status})`);
+  const secrets = (await secretsRes.json()) as Record<string, number[]>;
+  const version = Math.max(...Object.keys(secrets).map(Number)).toString();
+
+  // the secret ships obfuscated: each byte XORed with its index
+  const decoded = secrets[version]!.map((v, i) => v ^ ((i % 33) + 9)).join("");
+  const totp = new OTPAuth.TOTP({
+    secret: OTPAuth.Secret.fromHex(Buffer.from(decoded, "utf8").toString("hex")),
+  }).generate();
+
+  const url = new URL("https://open.spotify.com/api/token");
+  url.search = new URLSearchParams({
+    reason: "init",
+    productType: "web-player",
+    totp,
+    totpServer: totp,
+    totpVer: version,
+  }).toString();
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      "App-Platform": "WebPlayer",
+      Referer: "https://open.spotify.com/",
+      Cookie: `sp_dc=${spDc}`,
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  const data = (await res.json().catch(() => ({}))) as {
+    accessToken?: string;
+    accessTokenExpirationTimestampMs?: number;
+    isAnonymous?: boolean;
+  };
+  if (!res.ok || !data.accessToken) {
+    throw new Error(`Web player token refused (HTTP ${res.status}, totpVer ${version})`);
+  }
+  if (data.isAnonymous) throw new Error("sp_dc cookie is invalid or expired");
+  return {
+    token: data.accessToken,
+    expiresAt: data.accessTokenExpirationTimestampMs ?? Date.now() + 3600_000,
+  };
 }

@@ -1,125 +1,68 @@
-
 # Fastfetch Spotify Canvas
 
-Only compatible in Terminals with Kitty graphics protocol.
-
-## Requirements
-
-- KGI supported terminal
-- bun/pnpm
+Shows the Spotify Canvas of the track you're playing (or the album cover if it has none) as your fastfetch logo.
 
 ## Showcase
 
-
 https://github.com/user-attachments/assets/dba217df-87bb-4916-8afd-80af3994f876
 
-## Steps
+## Requirements
 
-1. Clone the repo
+- A terminal with the Kitty graphics protocol (kitty, Ghostty, WezTerm, …) and `kitten`
+- Node.js 20.12+ and pnpm
+- `ffmpeg` and `fastfetch`
+- **Spotify Premium.** Since February 2026, Spotify developer apps in Development Mode only work if the app owner has an active Premium subscription.
 
-```sh
-git clone https://github.com/qeqqe/fastfetch-spotify-canvas.git ~/fastfetch-spotify-canvas
-```
+## Setup
 
-2. Install dependencies
+1. **Clone and install**
 
-```sh
-cd ~/fastfetch-spotify-canvas
-pnpm install
-# or if you prefer bun:
-bun install
-```
+   ```sh
+   git clone https://github.com/qeqqe/fastfetch-spotify-canvas.git ~/fastfetch-spotify-canvas
+   ~/fastfetch-spotify-canvas/install.sh
+   ```
 
-3. Build
+   This checks dependencies, builds, creates `.env`, and links `fetchcanvas` into `~/.local/bin`, so it works in any shell. Re-run it after a `git pull` to rebuild.
 
-```sh
-pnpm run build
-# or if you prefer bun:
-bun run build
-```
+2. **Create a Spotify app**
 
-4. Set up Spotify authentication
+   - Go to the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and create an app with **Web API** selected.
+   - Add the redirect URI `http://127.0.0.1:5555/callback`. It must be exactly this; `localhost` is not allowed.
+   - Put the Client ID and Client Secret in `.env`.
 
-- Rename `.env.example` to `.env`
-- Follow the [CLI-based authentication guide](#cli-based-authentication) below to get your refresh tokens
+3. **Get your `sp_dc` cookie**
 
-5. Add the alias to your shell config
+   Log in at [open.spotify.com](https://open.spotify.com), then open DevTools → Application → Cookies → `https://open.spotify.com` and copy the value of `sp_dc` into `.env`. It lasts about a year, and logging out of the web player invalidates it.
 
-Put this in `~/.bashrc` or `~/.zshrc`:
+4. **Authorize**
 
-```sh
-alias fetchcanvas="$HOME/fastfetch-spotify-canvas/script.sh"
-```
+   ```sh
+   pnpm run auth
+   ```
 
-Then reload your shell config:
+   This opens your browser. Once you approve, `SPOTIFY_REFRESH_TOKEN` is written to `.env`.
 
-```sh
-source ~/.bashrc
-# or
-source ~/.zshrc
-```
+5. **Run**
 
-6. Run
+   ```sh
+   fetchcanvas
+   ```
 
-```sh
-fetchcanvas
-```
+## How it works
 
-## CLI-Based Authentication
+- Your current (or most recently played) track comes from the official Web API, using your app's refresh token.
+- The canvas comes from the same internal GraphQL query the Spotify web player uses, authenticated with your `sp_dc` cookie. The video is converted to a GIF with ffmpeg.
+- Media is cached per track in `~/images/fastfetch/media`.
 
-Complete Spotify OAuth setup entirely from the terminal:
+## Troubleshooting
 
-1. **Create a Spotify Developer App**
-   - Go to https://developer.spotify.com/dashboard
-   - Click "Create app"
-   - Set redirect URI to: `http://127.0.0.1:5555/callback`
-   - Copy your Client ID and Client Secret
+Logs from the last run are in `~/.cache/fastfetch-canvas.log`. To uninstall, delete `~/.local/bin/fetchcanvas`.
 
-2. **Add credentials to `.env`**
-
-```sh
-SP_DC=get-from-spotify-web-cookies
-
-SPOTIFY_CLIENT_ID=your_client_id_here
-SPOTIFY_CLIENT_SECRET=your_client_secret_here
-```
-
-3. **Get authorization code**
-
-Open this URL in your browser (replace `YOUR_CLIENT_ID`):
-
-```
-https://accounts.spotify.com/authorize?client_id=YOUR_CLIENT_ID&response_type=code&redirect_uri=http://127.0.0.1:5555/callback&scope=user-read-recently-played%20user-read-currently-playing%20user-read-playback-state
-```
-
-After authorizing, you'll be redirected to a URL like:
-```
-http://127.0.0.1:5555/callback?code=AQB3tYro...
-```
-
-Copy the `code` parameter value.
-
-4. **Exchange code for refresh token**
-
-```sh
-curl -X POST "https://accounts.spotify.com/api/token" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -H "Authorization: Basic $(echo -n 'YOUR_CLIENT_ID:YOUR_CLIENT_SECRET' | base64)" \
-  -d "grant_type=authorization_code" \
-  -d "code=YOUR_CODE_FROM_STEP_3" \
-  -d "redirect_uri=http://127.0.0.1:5555/callback"
-```
-
-5. **Save refresh token**
-
-From the response JSON, copy the `refresh_token` value and add it to `.env`:
-
-```sh
-SPOTIFY_REFRESH_TOKEN=your_refresh_token_here
-```
-
-Done! Your `.env` should now have all three values. The access token will auto-refresh when needed.
+- **`Refresh token rejected`**: run `pnpm run auth` again, and check that the app owner still has Premium.
+- **`Canvas lookup failed, using album cover`**: the canvas side relies on unofficial web player internals that Spotify changes from time to time.
+  - `sp_dc cookie is invalid or expired`: grab a fresh cookie.
+  - `Web player token refused`: Spotify rotated its TOTP secret. Wait for the secrets source to update, or point `SPOTIFY_SECRETS_URL` at a source that has the new one.
 
 ---
 
-Special thanks to https://github.com/bartleyg/my-spotify-canvas.git for reverse engineering the Canvas API.
+Thanks to [bartleyg/my-spotify-canvas](https://github.com/bartleyg/my-spotify-canvas) for the original Canvas reverse engineering, and [BitChord](https://github.com/kushagrasinghx/BitChord) for the current GraphQL query.
