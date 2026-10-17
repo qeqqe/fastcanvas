@@ -4,7 +4,7 @@ Shows the Spotify Canvas of the track you're playing (or the album cover if it h
 
 ## Showcase
 
-https://github.com/user-attachments/assets/dba217df-87bb-4916-8afd-80af3994f876
+<https://github.com/user-attachments/assets/dba217df-87bb-4916-8afd-80af3994f876>
 
 ## Requirements
 
@@ -25,7 +25,6 @@ https://github.com/user-attachments/assets/dba217df-87bb-4916-8afd-80af3994f876
    This checks dependencies, builds, creates `.env`, and links `fetchcanvas` into `~/.local/bin`, so it works in any shell. Re-run it after a `git pull` to rebuild.
 
 2. **Create a Spotify app**
-
    - Go to the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and create an app with **Web API** selected.
    - Add the redirect URI `http://127.0.0.1:5555/callback`. It must be exactly this; `localhost` is not allowed.
    - Put the Client ID and Client Secret in `.env`.
@@ -65,4 +64,4 @@ Logs from the last run are in `~/.cache/fastfetch-canvas.log`. To uninstall, del
 
 ---
 
-Thanks to [bartleyg/my-spotify-canvas](https://github.com/bartleyg/my-spotify-canvas) for the original Canvas reverse engineering, and [BitChord](https://github.com/kushagrasinghx/BitChord) for the current GraphQL query.
+Thanks to [bartleyg/my-spotify-canvas](https://github.com/bartleyg/my-spotify-canvas) for the original Canvas reverse engineering, and [This PR](https://github.com/kushagrasinghx/BitChord/pull/46) for the current GraphQL query.
